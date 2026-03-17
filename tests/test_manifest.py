@@ -15,7 +15,6 @@ from agent.manifest import (
     generate_manifest,
     save_manifest,
 )
-from agent.models import FileEntry, SessionManifest
 
 
 @pytest.fixture()

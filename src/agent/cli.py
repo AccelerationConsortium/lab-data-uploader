@@ -11,7 +11,6 @@ from agent.config import load_config
 from agent.logging_utils import get_logger, setup_logging
 from agent.manifest import compute_manifest_hash, generate_manifest
 from agent.scheduler import UploadScheduler
-from agent.state_db import StateDB
 
 app = typer.Typer(name="uploader-agent", help="Lab Data Uploader Agent")
 

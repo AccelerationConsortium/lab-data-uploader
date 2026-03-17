@@ -259,7 +259,7 @@ def test_failed_upload_then_retry(app_config, session_root):
     respx.post("https://api.test.com/register-session").mock(side_effect=register_side_effect)
 
     # First: S3 uploads fail
-    s3_fail_route = respx.put(url__startswith="https://s3.test.com/").mock(
+    respx.put(url__startswith="https://s3.test.com/").mock(
         return_value=httpx.Response(500, text="Internal Server Error")
     )
 
@@ -369,7 +369,7 @@ def test_session_change_triggers_new_version(app_config, session_root):
     respx.put(url__startswith="https://s3.test.com/").mock(
         return_value=httpx.Response(200)
     )
-    complete_route_2 = respx.post("https://api.test.com/complete-session").mock(
+    respx.post("https://api.test.com/complete-session").mock(
         return_value=httpx.Response(200, json={"status": "ok"})
     )
 

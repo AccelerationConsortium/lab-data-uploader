@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import time
 
-import pytest
 
 from agent.completion_detector import CompletionDetector
 from agent.models import SessionProfile
