@@ -75,7 +75,6 @@ class TestDefaultValues:
 
     def test_upload_defaults(self, tmp_path: Path) -> None:
         cfg = load_config(_write(tmp_path, VALID_YAML))
-        assert cfg.upload.auth_token_env == "UPLOAD_AGENT_TOKEN"
         assert cfg.upload.request_timeout_seconds == 60
         assert cfg.upload.max_retries == 10
         assert cfg.upload.initial_backoff_seconds == 30

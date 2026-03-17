@@ -16,14 +16,12 @@ BASE_URL = "https://api.example.com"
 def config() -> UploadConfig:
     return UploadConfig(
         api_base_url=BASE_URL,
-        auth_token_env="TEST_UPLOAD_TOKEN",
         request_timeout_seconds=5,
     )
 
 
 @pytest.fixture()
-def client(config: UploadConfig, monkeypatch: pytest.MonkeyPatch) -> UploadAPIClient:
-    monkeypatch.setenv("TEST_UPLOAD_TOKEN", "test-secret-token")
+def client(config: UploadConfig) -> UploadAPIClient:
     c = UploadAPIClient(config)
     yield c
     c.close()
@@ -65,9 +63,8 @@ class TestRegisterSessionUploadRequired:
         assert len(result.presigned_urls) == 2
         assert result.upload_id == "upload-abc-123"
 
-        # Verify request payload
-        req = respx.calls.last.request
-        assert req.headers["Authorization"] == "Bearer test-secret-token"
+        # Verify request was sent
+        assert respx.calls.last.request is not None
 
 
 class TestRegisterSessionDuplicate:
@@ -229,21 +226,6 @@ class TestHTTPErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# Auth token tests
-# ---------------------------------------------------------------------------
-
-
-class TestMissingAuthToken:
-    def test_raises_on_missing_token(
-        self, config: UploadConfig, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("TEST_UPLOAD_TOKEN", raising=False)
-
-        with pytest.raises(ValueError, match="not set"):
-            UploadAPIClient(config)
-
-
-# ---------------------------------------------------------------------------
 # Context manager tests
 # ---------------------------------------------------------------------------
 
@@ -251,10 +233,8 @@ class TestMissingAuthToken:
 class TestContextManager:
     @respx.mock
     def test_works_as_context_manager(
-        self, config: UploadConfig, monkeypatch: pytest.MonkeyPatch
+        self, config: UploadConfig,
     ) -> None:
-        monkeypatch.setenv("TEST_UPLOAD_TOKEN", "test-secret-token")
-
         respx.post(f"{BASE_URL}/register-session").mock(
             return_value=httpx.Response(
                 200,

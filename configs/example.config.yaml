@@ -33,7 +33,6 @@ profiles:
 
 upload:
   api_base_url: "https://backend.example.com/api/uploads"
-  auth_token_env: "UPLOAD_AGENT_TOKEN"
   request_timeout_seconds: 60
   max_retries: 10
   initial_backoff_seconds: 30

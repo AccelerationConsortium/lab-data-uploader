@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import httpx
 import structlog
 
@@ -15,21 +13,13 @@ logger = structlog.get_logger("api_client")
 class UploadAPIClient:
     """HTTP client for the backend upload API.
 
-    Uses httpx with Bearer token authentication read from an environment variable.
     Supports use as a context manager for automatic resource cleanup.
     """
 
     def __init__(self, config: UploadConfig) -> None:
-        token = os.environ.get(config.auth_token_env)
-        if not token:
-            raise ValueError(
-                f"Auth token environment variable '{config.auth_token_env}' is not set"
-            )
-
         self._base_url = config.api_base_url.rstrip("/")
         self._client = httpx.Client(
             timeout=config.request_timeout_seconds,
-            headers={"Authorization": f"Bearer {token}"},
         )
 
     # -- Context manager --------------------------------------------------

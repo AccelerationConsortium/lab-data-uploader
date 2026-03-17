@@ -60,7 +60,6 @@ class SessionProfile(BaseModel):
 
 class UploadConfig(BaseModel):
     api_base_url: str
-    auth_token_env: str = "UPLOAD_AGENT_TOKEN"
     request_timeout_seconds: int = 60
     max_retries: int = 10
     initial_backoff_seconds: int = 30

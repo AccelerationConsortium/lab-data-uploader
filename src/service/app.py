@@ -5,7 +5,6 @@ Usage:
     PYTHONPATH=src uvicorn service.app:app --reload --port 8000
 
 Environment variables:
-    UPLOAD_SERVICE_TOKEN  — Bearer token the agent must send (default: "dev-token")
     S3_BUCKET             — S3 bucket name (default: "battery-etl-dev-data")
     S3_REGION             — AWS region (default: "ca-central-1")
     S3_PREFIX             — Optional key prefix inside the bucket (default: "")
@@ -19,7 +18,7 @@ import logging
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException
 
 from service.models import (
     CompleteSessionRequest,
@@ -66,23 +65,6 @@ def get_s3() -> S3PresignedClient:
 
 
 # ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-EXPECTED_TOKEN = os.environ.get("UPLOAD_SERVICE_TOKEN", "dev-token")
-
-
-async def verify_token(request: Request) -> None:
-    """Simple Bearer token verification."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.removeprefix("Bearer ").strip()
-    if token != EXPECTED_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-
-# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -90,7 +72,6 @@ async def verify_token(request: Request) -> None:
 @app.post(
     "/register-session",
     response_model=RegisterSessionResponse,
-    dependencies=[Depends(verify_token)],
 )
 async def register_session(
     body: RegisterSessionRequest,
@@ -155,7 +136,6 @@ async def register_session(
 @app.post(
     "/complete-session",
     response_model=CompleteSessionResponse,
-    dependencies=[Depends(verify_token)],
 )
 async def complete_session(
     body: CompleteSessionRequest,

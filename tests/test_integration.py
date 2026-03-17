@@ -7,8 +7,6 @@ with a mocked backend API.
 from __future__ import annotations
 
 import json
-import os
-import time
 
 import httpx
 import pytest
@@ -60,7 +58,6 @@ def app_config(tmp_path, session_root):
         },
         upload={
             "api_base_url": "https://api.test.com",
-            "auth_token_env": "TEST_TOKEN",
             "request_timeout_seconds": 5,
             "max_retries": 3,
             "initial_backoff_seconds": 1,
@@ -71,11 +68,6 @@ def app_config(tmp_path, session_root):
             "log_dir": str(tmp_path / "logs"),
         },
     )
-
-
-@pytest.fixture(autouse=True)
-def _set_token(monkeypatch):
-    monkeypatch.setenv("TEST_TOKEN", "test-bearer-token")
 
 
 # --------------------------------------------------------------------------
