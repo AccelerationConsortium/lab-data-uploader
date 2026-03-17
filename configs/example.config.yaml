@@ -1,0 +1,44 @@
+agent:
+  machine_id: labpc-01
+  lab_id: sdl1
+  scan_interval_seconds: 60
+  stable_window_seconds: 300
+  timezone: America/Toronto
+
+watch:
+  session_roots:
+    - path: "D:/LabData/BatterySessions"
+      profile: battery_session
+    - path: "D:/LabData/CameraRuns"
+      profile: camera_session
+
+profiles:
+  battery_session:
+    required_markers:
+      - "session_summary.json"
+    ignore_patterns:
+      - "*.tmp"
+      - "*.lock"
+    metadata_files:
+      - "metadata.json"
+      - "run.log"
+
+  camera_session:
+    required_markers:
+      - "capture_done.flag"
+    ignore_patterns:
+      - "*.part"
+    metadata_files:
+      - "capture_meta.json"
+
+upload:
+  api_base_url: "https://backend.example.com/api/uploads"
+  auth_token_env: "UPLOAD_AGENT_TOKEN"
+  request_timeout_seconds: 60
+  max_retries: 10
+  initial_backoff_seconds: 30
+
+storage:
+  local_state_db: "./state/upload_state.db"
+  manifest_cache_dir: "./state/manifests"
+  log_dir: "./logs"
