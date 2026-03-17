@@ -90,7 +90,6 @@ profiles:
 ### Run the Agent
 
 ```bash
-export UPLOAD_AGENT_TOKEN="your-token"
 uploader-agent run --config config.yaml
 ```
 
