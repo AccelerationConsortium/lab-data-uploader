@@ -1,16 +1,15 @@
 """Integration tests for the full upload pipeline.
 
 These tests simulate the scheduler processing sessions end-to-end
-with a mocked backend API.
+with mocked S3 and Step Functions.
 """
 
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
-import respx
 
 from agent.models import AppConfig
 from agent.scheduler import UploadScheduler
@@ -24,15 +23,11 @@ def session_root(tmp_path):
     session = root / "session_001"
     session.mkdir()
 
-    # Write data files
     (session / "data.csv").write_text("a,b,c\n1,2,3\n")
     (session / "log.txt").write_text("experiment completed\n")
 
-    # Write metadata
     meta = {"session_id": "SES-001", "experiment": "test"}
     (session / "metadata.json").write_text(json.dumps(meta))
-
-    # Write required marker
     (session / "session_summary.json").write_text('{"status":"done"}')
 
     return root
@@ -46,7 +41,7 @@ def app_config(tmp_path, session_root):
             "machine_id": "test-pc",
             "lab_id": "test-lab",
             "scan_interval_seconds": 1,
-            "stable_window_seconds": 0,  # instant stability for testing
+            "stable_window_seconds": 0,
         },
         watch={"session_roots": [{"path": str(session_root), "profile": "test_profile"}]},
         profiles={
@@ -57,8 +52,9 @@ def app_config(tmp_path, session_root):
             }
         },
         upload={
-            "api_base_url": "https://api.test.com",
-            "request_timeout_seconds": 5,
+            "s3_bucket": "test-bucket",
+            "s3_region": "us-east-1",
+            "s3_prefix": "lab",
             "max_retries": 3,
             "initial_backoff_seconds": 1,
         },
@@ -70,42 +66,22 @@ def app_config(tmp_path, session_root):
     )
 
 
+@pytest.fixture()
+def mock_s3():
+    with patch("agent.uploader.boto3") as mock_boto3:
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.put_object.return_value = {}
+        yield mock_client
+
+
 # --------------------------------------------------------------------------
 # Test: Successful end-to-end upload
 # --------------------------------------------------------------------------
 
 
-@respx.mock
-def test_full_upload_pipeline(app_config, session_root):
-    """Simulate a complete session upload cycle: scan -> detect -> manifest -> register -> upload -> complete."""
-
-    # Mock register-session endpoint
-    register_route = respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": "upload-001",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=1",
-                    "log.txt": "https://s3.test.com/log.txt?signed=1",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=1",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=1",
-                },
-            },
-        )
-    )
-
-    # Mock S3 presigned upload endpoints
-    s3_route = respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-
-    # Mock complete-session endpoint
-    complete_route = respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok", "message": "ingestion started"})
-    )
-
+def test_full_upload_pipeline(app_config, session_root, mock_s3):
+    """Simulate a complete session upload: scan -> detect -> manifest -> upload to S3."""
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
@@ -118,23 +94,15 @@ def test_full_upload_pipeline(app_config, session_root):
     # Second scan: with stable_window=0, session should now be stable
     scheduler.run_once()
 
-    # Verify register was called
-    assert register_route.called
-    register_body = json.loads(register_route.calls.last.request.content)
-    assert register_body["session_id"] == "SES-001"
-    assert register_body["machine_id"] == "test-pc"
-    assert register_body["lab_id"] == "test-lab"
+    # Verify S3 uploads happened (4 data files + 1 manifest.json)
+    assert mock_s3.put_object.call_count == 5
 
-    # Verify S3 uploads happened (4 files)
-    assert s3_route.call_count == 4
+    # Verify S3 keys include the prefix
+    keys = [call.kwargs["Key"] for call in mock_s3.put_object.call_args_list]
+    assert all(k.startswith("lab/SES-001/") for k in keys)
+    assert "lab/SES-001/manifest.json" in keys
 
-    # Verify complete was called
-    assert complete_route.called
-    complete_body = json.loads(complete_route.calls.last.request.content)
-    assert complete_body["session_id"] == "SES-001"
-    assert len(complete_body["uploaded_files"]) == 4
-
-    # Verify DB state is 'uploaded'
+    # Verify DB state
     session_row = scheduler._db.get_session("SES-001")
     assert session_row is not None
     assert session_row["status"] == "uploaded"
@@ -148,32 +116,8 @@ def test_full_upload_pipeline(app_config, session_root):
 # --------------------------------------------------------------------------
 
 
-@respx.mock
-def test_duplicate_upload_skipped(app_config, session_root):
+def test_duplicate_upload_skipped(app_config, session_root, mock_s3):
     """After a successful upload, a second scan should detect the duplicate and skip."""
-
-    respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": "upload-001",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=1",
-                    "log.txt": "https://s3.test.com/log.txt?signed=1",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=1",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=1",
-                },
-            },
-        )
-    )
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-    complete_route = respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok"})
-    )
-
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
@@ -183,48 +127,14 @@ def test_duplicate_upload_skipped(app_config, session_root):
     # Two scans to complete first upload
     scheduler.run_once()
     scheduler.run_once()
-    assert complete_route.call_count == 1
+    first_put_count = mock_s3.put_object.call_count
 
-    # Third scan should detect duplicate and NOT call complete again
+    # Third scan should detect duplicate and NOT upload again
     scheduler.run_once()
-    assert complete_route.call_count == 1  # still 1, not called again
+    assert mock_s3.put_object.call_count == first_put_count  # no new uploads
 
     session_row = scheduler._db.get_session("SES-001")
-    # Local dedup detects same manifest_hash → marks as duplicate (no re-upload)
     assert session_row["status"] in ("uploaded", "duplicate")
-
-    scheduler.close()
-
-
-# --------------------------------------------------------------------------
-# Test: Backend reports duplicate
-# --------------------------------------------------------------------------
-
-
-@respx.mock
-def test_backend_duplicate_response(app_config, session_root):
-    """When backend says 'duplicate', agent should mark session accordingly."""
-
-    respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={"action": "duplicate", "upload_id": "", "presigned_urls": {}},
-        )
-    )
-
-    from agent.logging_utils import setup_logging
-
-    setup_logging(app_config.storage.log_dir)
-
-    scheduler = UploadScheduler(app_config)
-
-    # Two scans: first for stability, second for registration
-    scheduler.run_once()
-    scheduler.run_once()
-
-    session_row = scheduler._db.get_session("SES-001")
-    assert session_row is not None
-    assert session_row["status"] == "duplicate"
 
     scheduler.close()
 
@@ -234,44 +144,21 @@ def test_backend_duplicate_response(app_config, session_root):
 # --------------------------------------------------------------------------
 
 
-@respx.mock
-def test_failed_upload_then_retry(app_config, session_root):
+def test_failed_upload_then_retry(app_config, session_root, mock_s3):
     """When upload fails, session is marked failed and retried on next cycle."""
-
-    call_count = {"register": 0}
-
-    def register_side_effect(request):
-        call_count["register"] += 1
-        return httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": f"upload-{call_count['register']:03d}",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=1",
-                    "log.txt": "https://s3.test.com/log.txt?signed=1",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=1",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=1",
-                },
-            },
-        )
-
-    respx.post("https://api.test.com/register-session").mock(side_effect=register_side_effect)
-
-    # First: S3 uploads fail
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(500, text="Internal Server Error")
-    )
+    from botocore.exceptions import ClientError
 
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
 
+    # First: S3 uploads fail
+    error_response = {"Error": {"Code": "500", "Message": "Internal Error"}}
+    mock_s3.put_object.side_effect = ClientError(error_response, "PutObject")
+
     scheduler = UploadScheduler(app_config)
 
-    # Scan 1: detect for first time
     scheduler.run_once()
-    # Scan 2: stable -> register -> upload fails
     scheduler.run_once()
 
     session_row = scheduler._db.get_session("SES-001")
@@ -279,16 +166,9 @@ def test_failed_upload_then_retry(app_config, session_root):
     assert session_row["retry_count"] >= 1
 
     # Now make S3 succeed for retry
-    respx.reset()
-    respx.post("https://api.test.com/register-session").mock(side_effect=register_side_effect)
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok"})
-    )
+    mock_s3.put_object.side_effect = None
+    mock_s3.put_object.return_value = {}
 
-    # Scan 3: retry should succeed
     scheduler.run_once()
 
     session_row = scheduler._db.get_session("SES-001")
@@ -302,32 +182,8 @@ def test_failed_upload_then_retry(app_config, session_root):
 # --------------------------------------------------------------------------
 
 
-@respx.mock
-def test_session_change_triggers_new_version(app_config, session_root):
+def test_session_change_triggers_new_version(app_config, session_root, mock_s3):
     """If session content changes after upload, new manifest_hash triggers re-upload."""
-
-    respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": "upload-001",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=1",
-                    "log.txt": "https://s3.test.com/log.txt?signed=1",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=1",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=1",
-                },
-            },
-        )
-    )
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-    complete_route = respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok"})
-    )
-
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
@@ -337,7 +193,6 @@ def test_session_change_triggers_new_version(app_config, session_root):
     # Complete first upload
     scheduler.run_once()
     scheduler.run_once()
-    assert complete_route.call_count == 1
 
     first_hash = scheduler._db.get_session("SES-001")["manifest_hash"]
 
@@ -348,38 +203,12 @@ def test_session_change_triggers_new_version(app_config, session_root):
     # Reset detector snapshots so it re-evaluates stability
     scheduler._detector._snapshots.clear()
 
-    # Update presigned URLs to include new file
-    respx.reset()
-    respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": "upload-002",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=2",
-                    "log.txt": "https://s3.test.com/log.txt?signed=2",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=2",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=2",
-                    "extra_data.csv": "https://s3.test.com/extra_data.csv?signed=2",
-                },
-            },
-        )
-    )
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok"})
-    )
-
     # Two scans: first re-detects, second uploads new version
     scheduler.run_once()
     scheduler.run_once()
 
     session_row = scheduler._db.get_session("SES-001")
     assert session_row["status"] == "uploaded"
-    # Manifest hash should have changed
     assert session_row["manifest_hash"] != first_hash
 
     scheduler.close()
@@ -390,7 +219,7 @@ def test_session_change_triggers_new_version(app_config, session_root):
 # --------------------------------------------------------------------------
 
 
-def test_empty_root_folder(app_config, tmp_path):
+def test_empty_root_folder(app_config, tmp_path, mock_s3):
     """Agent handles empty session root gracefully."""
     empty_root = tmp_path / "empty_sessions"
     empty_root.mkdir()
@@ -412,33 +241,10 @@ def test_empty_root_folder(app_config, tmp_path):
 # --------------------------------------------------------------------------
 
 
-@respx.mock
-def test_temp_files_ignored(app_config, session_root):
+def test_temp_files_ignored(app_config, session_root, mock_s3):
     """Files matching ignore_patterns (*.tmp) should not appear in manifest."""
     session_dir = session_root / "session_001"
     (session_dir / "temp_data.tmp").write_text("temporary data")
-
-    respx.post("https://api.test.com/register-session").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "action": "upload_required",
-                "upload_id": "upload-001",
-                "presigned_urls": {
-                    "data.csv": "https://s3.test.com/data.csv?signed=1",
-                    "log.txt": "https://s3.test.com/log.txt?signed=1",
-                    "metadata.json": "https://s3.test.com/metadata.json?signed=1",
-                    "session_summary.json": "https://s3.test.com/session_summary.json?signed=1",
-                },
-            },
-        )
-    )
-    respx.put(url__startswith="https://s3.test.com/").mock(
-        return_value=httpx.Response(200)
-    )
-    respx.post("https://api.test.com/complete-session").mock(
-        return_value=httpx.Response(200, json={"status": "ok"})
-    )
 
     from agent.logging_utils import setup_logging
 
@@ -454,3 +260,40 @@ def test_temp_files_ignored(app_config, session_root):
     assert session_row["file_count"] == 4
 
     scheduler.close()
+
+
+# --------------------------------------------------------------------------
+# Test: Step Functions triggered on success
+# --------------------------------------------------------------------------
+
+
+def test_step_functions_triggered(app_config, session_root, mock_s3):
+    """When step_function_arn is set, Step Functions is triggered after upload."""
+    app_config.upload.step_function_arn = (
+        "arn:aws:states:us-east-1:123456789:stateMachine:TestMachine"
+    )
+
+    from agent.logging_utils import setup_logging
+
+    setup_logging(app_config.storage.log_dir)
+
+    with patch("agent.step_functions.boto3") as mock_sfn_boto3:
+        mock_sfn_client = MagicMock()
+        mock_sfn_boto3.client.return_value = mock_sfn_client
+        mock_sfn_client.start_execution.return_value = {
+            "executionArn": "arn:aws:states:us-east-1:123456789:execution:TestMachine:x"
+        }
+
+        scheduler = UploadScheduler(app_config)
+        scheduler.run_once()
+        scheduler.run_once()
+
+        # Verify Step Functions was called
+        assert mock_sfn_client.start_execution.call_count == 1
+
+        call_kwargs = mock_sfn_client.start_execution.call_args.kwargs
+        input_data = json.loads(call_kwargs["input"])
+        assert input_data["session_id"] == "SES-001"
+        assert input_data["total_files"] == 4
+
+        scheduler.close()

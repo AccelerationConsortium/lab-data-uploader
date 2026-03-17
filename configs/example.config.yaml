@@ -32,8 +32,10 @@ profiles:
       - "capture_meta.json"
 
 upload:
-  api_base_url: "https://backend.example.com/api/uploads"
-  request_timeout_seconds: 60
+  s3_bucket: "battery-etl-dev-data"
+  s3_region: "ca-central-1"
+  s3_prefix: ""
+  step_function_arn: ""  # set to ARN to enable post-upload trigger
   max_retries: 10
   initial_backoff_seconds: 30
 

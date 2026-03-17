@@ -1,51 +1,44 @@
 # Lab Data Uploader
 
-A local agent that runs on lab PCs to automatically detect completed experiment sessions and upload them to S3.
+An ECS-based agent that detects completed experiment sessions from lab PC shared directories and uploads them to S3.
 
 ## How It Works
 
 ```
-Lab PC                                         AWS
-┌─────────────────────┐                       ┌──────────────────┐
-│  Session Folders     │                      │  S3 Bucket       │
-│  /LabData/session-01 │──scan──▶ Agent       │                  │
-│  /LabData/session-02 │         │            │  session-01/     │
-│                      │         ▼            │    data.csv      │
-│                      │  Detect completion   │    metadata.json │
-│                      │  Build manifest      │  session-02/     │
-│                      │  Dedup check         │    ...           │
-│                      │         │            │                  │
-│                      │         ▼            │                  │
-│                      │  Upload Service ────▶│  (presigned PUT) │
-└─────────────────────┘  (presigned URLs)     └──────────────────┘
+Lab PCs (shared dirs)         ECS Task                    AWS
+┌────────────────────┐       ┌──────────────┐           ┌─────────────────┐
+│ /mnt/labpc-01/     │       │              │           │  S3 Bucket      │
+│   session-01/      │◀─VPN─▶│  Uploader    │──boto3──▶ │  session-01/    │
+│   session-02/      │       │  Agent       │           │  session-02/    │
+│ /mnt/labpc-02/     │       │              │──trigger─▶│  Step Functions │
+│   session-03/      │       │              │           │  (validation)   │
+└────────────────────┘       └──────────────┘           └─────────────────┘
+  Tailscale / VPN              IAM Role
 ```
 
-1. **Scan** — watches configured directories for experiment session folders
+1. **Scan** — watches shared directories (mounted via Tailscale/VPN) for session folders
 2. **Detect completion** — waits for marker files and file stability (no writes for N seconds)
 3. **Generate manifest** — lists all files with SHA256 checksums
 4. **Deduplicate** — skips sessions already uploaded (by session ID + manifest hash)
-5. **Upload** — registers with the upload service, gets presigned S3 URLs, uploads via HTTP PUT
-6. **Track state** — records progress in a local SQLite database
+5. **Upload** — uploads files directly to S3 via boto3 (IAM role on ECS)
+6. **Trigger** — invokes Step Functions for post-upload validation (optional)
+7. **Track state** — records progress in a local SQLite database
 
 ## Project Structure
 
 ```
-src/
-├── agent/          # Local agent (runs on lab PCs)
-│   ├── cli.py          # CLI entry point (typer)
-│   ├── scheduler.py    # Main polling loop
-│   ├── scanner.py      # Session directory scanner
-│   ├── completion_detector.py
-│   ├── manifest.py     # Manifest generation + hashing
-│   ├── dedup.py        # Deduplication checker
-│   ├── api_client.py   # HTTP client for upload service
-│   ├── uploader.py     # Presigned URL file uploader
-│   └── state_db.py     # SQLite state tracking
-├── service/        # Upload service (FastAPI)
-│   ├── app.py          # API endpoints
-│   ├── s3_client.py    # Presigned URL generation (boto3)
-│   ├── store.py        # Server-side session tracking
-│   └── models.py       # Request/response models
+src/agent/
+├── cli.py                 # CLI entry point (typer)
+├── scheduler.py           # Main polling loop
+├── scanner.py             # Session directory scanner
+├── completion_detector.py # File stability detection
+├── manifest.py            # Manifest generation + hashing
+├── dedup.py               # Deduplication checker
+├── uploader.py            # Direct S3 upload (boto3)
+├── step_functions.py      # Step Functions trigger
+├── state_db.py            # SQLite state tracking
+├── retry.py               # Exponential backoff retry
+└── models.py              # Pydantic config + data models
 ```
 
 ## Quick Start
@@ -58,13 +51,11 @@ pip install git+https://github.com/SissiFeng/lab-data-uploader.git
 
 ### Configure
 
-Copy and edit the example config:
-
 ```bash
 cp configs/example.config.yaml config.yaml
 ```
 
-Key settings in `config.yaml`:
+Key settings:
 
 ```yaml
 agent:
@@ -75,7 +66,7 @@ agent:
 
 watch:
   session_roots:
-    - path: "/path/to/sessions"
+    - path: "/mnt/labpc-01/sessions"
       profile: battery_session
 
 profiles:
@@ -85,9 +76,14 @@ profiles:
     ignore_patterns:
       - "*.tmp"
       - "*.lock"
+
+upload:
+  s3_bucket: "battery-etl-dev-data"
+  s3_region: "ca-central-1"
+  step_function_arn: ""  # optional
 ```
 
-### Run the Agent
+### Run
 
 ```bash
 uploader-agent run --config config.yaml
@@ -96,22 +92,9 @@ uploader-agent run --config config.yaml
 Other commands:
 
 ```bash
-uploader-agent scan-once --config config.yaml    # single scan cycle
+uploader-agent scan-once --config config.yaml
 uploader-agent validate-config --config config.yaml
-uploader-agent print-manifest --session-path /path/to/session
-```
-
-### Run the Upload Service
-
-```bash
-pip install "lab-data-uploader[service]"
-
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-export S3_BUCKET="battery-etl-dev-data"
-export S3_REGION="ca-central-1"
-
-PYTHONPATH=src uvicorn service.app:app --port 8000
+uploader-agent print-manifest --session-path /path/to/session --config config.yaml
 ```
 
 ## Update
@@ -126,6 +109,6 @@ pip install --upgrade git+https://github.com/SissiFeng/lab-data-uploader.git
 git clone https://github.com/SissiFeng/lab-data-uploader.git
 cd lab-data-uploader
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,service]"
+pip install -e ".[dev]"
 pytest tests/ -q
 ```

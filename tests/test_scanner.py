@@ -32,7 +32,7 @@ def _make_config(
         agent=AgentConfig(machine_id="test-pc", lab_id="test-lab"),
         watch=WatchConfig(session_roots=roots),
         profiles=profiles or {},
-        upload=UploadConfig(api_base_url="https://api.example.com"),
+        upload=UploadConfig(s3_bucket="test-bucket"),
         storage=StorageConfig(),
     )
 

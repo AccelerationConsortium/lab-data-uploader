@@ -31,7 +31,7 @@ VALID_YAML = textwrap.dedent("""\
           - "done.flag"
 
     upload:
-      api_base_url: "https://api.example.com"
+      s3_bucket: "test-bucket"
 
     storage: {}
 """)
@@ -63,7 +63,7 @@ class TestLoadValidConfig:
         assert cfg.agent.machine_id == "labpc-01"
         assert cfg.watch.session_roots[0].profile == "default"
         assert cfg.profiles["default"].required_markers == ["done.flag"]
-        assert cfg.upload.api_base_url == "https://api.example.com"
+        assert cfg.upload.s3_bucket == "test-bucket"
 
 
 class TestDefaultValues:
@@ -75,7 +75,10 @@ class TestDefaultValues:
 
     def test_upload_defaults(self, tmp_path: Path) -> None:
         cfg = load_config(_write(tmp_path, VALID_YAML))
-        assert cfg.upload.request_timeout_seconds == 60
+        assert cfg.upload.s3_bucket == "test-bucket"
+        assert cfg.upload.s3_region == "ca-central-1"
+        assert cfg.upload.s3_prefix == ""
+        assert cfg.upload.step_function_arn == ""
         assert cfg.upload.max_retries == 10
         assert cfg.upload.initial_backoff_seconds == 30
 
@@ -97,7 +100,7 @@ class TestDefaultValues:
             profiles:
               bare: {}
             upload:
-              api_base_url: "https://api.example.com"
+              s3_bucket: "test-bucket"
             storage: {}
         """)
         cfg = load_config(_write(tmp_path, yaml_text))
@@ -116,7 +119,7 @@ class TestMissingRequiredFields:
             profiles:
               p: {}
             upload:
-              api_base_url: "https://api.example.com"
+              s3_bucket: "test-bucket"
             storage: {}
         """)
         with pytest.raises(ValueError, match="validation failed"):
@@ -133,13 +136,13 @@ class TestMissingRequiredFields:
             profiles:
               p: {}
             upload:
-              api_base_url: "https://api.example.com"
+              s3_bucket: "test-bucket"
             storage: {}
         """)
         with pytest.raises(ValueError, match="validation failed"):
             load_config(_write(tmp_path, yaml_text))
 
-    def test_missing_api_base_url(self, tmp_path: Path) -> None:
+    def test_missing_s3_bucket(self, tmp_path: Path) -> None:
         yaml_text = textwrap.dedent("""\
             agent:
               machine_id: m1

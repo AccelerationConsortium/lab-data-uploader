@@ -59,8 +59,10 @@ class SessionProfile(BaseModel):
 
 
 class UploadConfig(BaseModel):
-    api_base_url: str
-    request_timeout_seconds: int = 60
+    s3_bucket: str
+    s3_region: str = "ca-central-1"
+    s3_prefix: str = ""
+    step_function_arn: str = ""  # empty = skip trigger
     max_retries: int = 10
     initial_backoff_seconds: int = 30
 
@@ -112,20 +114,6 @@ class DeduplicationResult:
     is_duplicate: bool
     existing_status: str | None = None
     existing_uploaded_at: str | None = None
-
-
-# --- API response models ---
-
-
-class RegisterResponse(BaseModel):
-    action: str  # "upload_required" | "duplicate" | "updated_version"
-    presigned_urls: dict[str, str] = {}
-    upload_id: str = ""
-
-
-class CompleteResponse(BaseModel):
-    status: str
-    message: str = ""
 
 
 # --- Upload result models ---

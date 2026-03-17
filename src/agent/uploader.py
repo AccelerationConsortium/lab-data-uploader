@@ -1,11 +1,13 @@
-"""Presigned URL file upload logic."""
+"""Direct S3 file upload using boto3."""
 
 from __future__ import annotations
 
+import json
 import os
 
-import httpx
+import boto3
 import structlog
+from botocore.exceptions import ClientError
 
 from agent.models import SessionManifest, UploadConfig, UploadResult
 from agent.retry import with_retry
@@ -14,22 +16,25 @@ logger = structlog.get_logger("uploader")
 
 
 class FileUploader:
-    """Uploads session files to S3 using backend-provided presigned URLs."""
+    """Uploads session files directly to S3 using boto3 (IAM role auth on ECS)."""
 
     def __init__(self, config: UploadConfig) -> None:
         self._config = config
+        self._bucket = config.s3_bucket
+        self._prefix = config.s3_prefix.strip("/")
+        self._s3 = boto3.client("s3", region_name=config.s3_region)
 
     def upload_session(
         self,
         session_path: str,
-        presigned_urls: dict[str, str],
         manifest: SessionManifest,
     ) -> UploadResult:
-        """Upload all files in a session manifest.
+        """Upload all files in a session manifest to S3.
+
+        S3 key pattern: {prefix}/{session_id}/{relative_path}
 
         Args:
             session_path: Absolute path to the session directory.
-            presigned_urls: Mapping of relative_path to presigned S3 URL.
             manifest: The session manifest describing files to upload.
 
         Returns:
@@ -40,24 +45,19 @@ class FileUploader:
         total_bytes = 0
 
         for file_entry in manifest.files:
-            presigned_url = presigned_urls.get(file_entry.relative_path)
-            if presigned_url is None:
-                logger.error(
-                    "upload_file_missing_url",
-                    session_id=manifest.session_id,
-                    relative_path=file_entry.relative_path,
-                )
-                failed.append(file_entry.relative_path)
-                continue
-
             file_path = os.path.join(session_path, file_entry.relative_path)
-            ok = self.upload_file(file_path, presigned_url)
+            s3_key = self._build_key(manifest.session_id, file_entry.relative_path)
 
+            ok = self._upload_file(file_path, s3_key)
             if ok:
                 uploaded.append(file_entry.relative_path)
                 total_bytes += file_entry.size
             else:
                 failed.append(file_entry.relative_path)
+
+        # Upload manifest JSON alongside session files
+        if uploaded:
+            self._upload_manifest(manifest)
 
         success = len(failed) == 0
 
@@ -69,41 +69,40 @@ class FileUploader:
             error=f"{len(failed)} file(s) failed to upload" if failed else None,
         )
 
-    def upload_file(self, file_path: str, presigned_url: str) -> bool:
-        """Upload a single file to a presigned URL with retry.
+    def _build_key(self, session_id: str, relative_path: str) -> str:
+        """Build the S3 object key."""
+        if self._prefix:
+            return f"{self._prefix}/{session_id}/{relative_path}"
+        return f"{session_id}/{relative_path}"
 
-        Args:
-            file_path: Absolute path to the local file.
-            presigned_url: Presigned S3 URL for PUT upload.
-
-        Returns:
-            True on success, False on failure.
-        """
+    def _upload_file(self, file_path: str, s3_key: str) -> bool:
+        """Upload a single file to S3 with retry."""
         try:
-            self._upload_with_retry(file_path, presigned_url)
-            logger.info(
-                "upload_file_succeeded",
-                file_path=file_path,
-            )
+            self._put_object_with_retry(file_path, s3_key)
+            logger.info("upload_file_succeeded", file_path=file_path, s3_key=s3_key)
             return True
         except Exception as exc:
             logger.error(
                 "upload_file_failed",
                 file_path=file_path,
+                s3_key=s3_key,
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
             return False
 
     @with_retry(max_retries=3, initial_backoff=1.0)
-    def _upload_with_retry(self, file_path: str, presigned_url: str) -> None:
-        """PUT file content to presigned URL. Retried on transient errors."""
+    def _put_object_with_retry(self, file_path: str, s3_key: str) -> None:
+        """PUT file to S3. Retried on transient errors."""
         with open(file_path, "rb") as f:
-            data = f.read()
+            self._s3.put_object(Bucket=self._bucket, Key=s3_key, Body=f)
 
-        response = httpx.put(
-            presigned_url,
-            content=data,
-            timeout=self._config.request_timeout_seconds,
-        )
-        response.raise_for_status()
+    def _upload_manifest(self, manifest: SessionManifest) -> None:
+        """Upload manifest.json alongside the session files."""
+        s3_key = self._build_key(manifest.session_id, "manifest.json")
+        try:
+            body = json.dumps(manifest.model_dump(), indent=2, sort_keys=True)
+            self._s3.put_object(Bucket=self._bucket, Key=s3_key, Body=body.encode())
+            logger.info("manifest_uploaded", s3_key=s3_key)
+        except ClientError as exc:
+            logger.warning("manifest_upload_failed", s3_key=s3_key, error=str(exc))

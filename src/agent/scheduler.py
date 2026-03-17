@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import threading
 
-from agent.api_client import UploadAPIClient
 from agent.completion_detector import CompletionDetector
 from agent.dedup import DeduplicationChecker
 from agent.logging_utils import get_logger
 from agent.manifest import compute_manifest_hash, generate_manifest, save_manifest
-from agent.models import AppConfig, CandidateSession
+from agent.models import AppConfig, CandidateSession, SessionManifest
 from agent.scanner import SessionScanner
 from agent.state_db import StateDB
+from agent.step_functions import StepFunctionsTrigger
 from agent.uploader import FileUploader
 
 
 class UploadScheduler:
-    """Orchestrates the full upload pipeline: scan, detect, manifest, dedup, upload."""
+    """Orchestrates the full upload pipeline: scan, detect, manifest, dedup, upload, trigger."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
@@ -28,8 +28,15 @@ class UploadScheduler:
         self._scanner = SessionScanner(config)
         self._detector = CompletionDetector(config.agent.stable_window_seconds)
         self._dedup = DeduplicationChecker(self._db)
-        self._api_client = UploadAPIClient(config.upload)
         self._uploader = FileUploader(config.upload)
+
+        # Step Functions trigger (optional — skip if ARN is empty)
+        self._sfn: StepFunctionsTrigger | None = None
+        if config.upload.step_function_arn:
+            self._sfn = StepFunctionsTrigger(
+                arn=config.upload.step_function_arn,
+                region=config.upload.s3_region,
+            )
 
         self._shutdown = threading.Event()
 
@@ -77,7 +84,7 @@ class UploadScheduler:
 
     def close(self) -> None:
         """Release resources held by the scheduler."""
-        self._api_client.close()
+        pass  # boto3 clients don't need explicit close
 
     # ------------------------------------------------------------------
     # Internal pipeline
@@ -89,7 +96,7 @@ class UploadScheduler:
         session_path = candidate.session_path
         profile_name = candidate.profile_name
 
-        # Step 2a - Check if already tracked as uploading (in progress)
+        # Skip if already uploading
         existing = self._db.get_session(session_id)
         if existing and existing["status"] == "uploading":
             self._logger.debug(
@@ -99,7 +106,7 @@ class UploadScheduler:
             )
             return
 
-        # Step 2b - Detect completion
+        # Detect completion
         profile = self._config.profiles[profile_name]
         result = self._detector.check(session_path, profile)
 
@@ -122,7 +129,7 @@ class UploadScheduler:
 
         self._logger.info("session_stable", session_id=session_id)
 
-        # Step 2c - Build manifest
+        # Build manifest
         manifest = generate_manifest(
             session_path=session_path,
             session_id=session_id,
@@ -131,7 +138,7 @@ class UploadScheduler:
             ignore_patterns=profile.ignore_patterns,
         )
 
-        # Step 2d - Compute manifest hash
+        # Compute manifest hash
         manifest_hash = compute_manifest_hash(manifest)
         self._logger.info(
             "manifest_created",
@@ -141,10 +148,10 @@ class UploadScheduler:
             total_bytes=manifest.total_bytes,
         )
 
-        # Step 2e - Save manifest to cache
+        # Save manifest to cache
         save_manifest(manifest, manifest_hash, self._config.storage.manifest_cache_dir)
 
-        # Step 2f - Local dedup check
+        # Local dedup check
         dedup_result = self._dedup.check(session_id, manifest_hash)
         if dedup_result.is_duplicate:
             self._db.upsert_session(
@@ -163,19 +170,18 @@ class UploadScheduler:
             )
             return
 
-        # Step 2g - Upsert as ready_to_register
+        # Mark as ready, then upload
         self._db.upsert_session(
             session_id=session_id,
             session_path=session_path,
             profile=profile_name,
             manifest_hash=manifest_hash,
-            status="ready_to_register",
+            status="ready_to_upload",
             file_count=manifest.file_count,
             total_bytes=manifest.total_bytes,
         )
 
-        # Steps 2h-2l - Register, upload, complete
-        self._register_and_upload(
+        self._upload_and_trigger(
             session_id=session_id,
             session_path=session_path,
             profile_name=profile_name,
@@ -183,41 +189,17 @@ class UploadScheduler:
             manifest_hash=manifest_hash,
         )
 
-    def _register_and_upload(
+    def _upload_and_trigger(
         self,
         session_id: str,
         session_path: str,
         profile_name: str,
-        manifest: object,
+        manifest: SessionManifest,
         manifest_hash: str,
     ) -> None:
-        """Register with backend, upload files, and complete the session."""
-        from agent.models import SessionManifest
+        """Upload files to S3 and trigger Step Functions on success."""
 
-        assert isinstance(manifest, SessionManifest)
-
-        # Step 2h - Register with backend (include file list for presigned URL generation)
-        reg = self._api_client.register_session(
-            session_id=session_id,
-            machine_id=self._config.agent.machine_id,
-            lab_id=self._config.agent.lab_id,
-            manifest_hash=manifest_hash,
-            file_count=manifest.file_count,
-            total_bytes=manifest.total_bytes,
-            schema_version=manifest.schema_version,
-            files=[f.relative_path for f in manifest.files],
-        )
-
-        if reg.action == "duplicate":
-            self._db.update_session_status(session_id, "duplicate")
-            self._logger.info(
-                "register_duplicate",
-                session_id=session_id,
-                manifest_hash=manifest_hash,
-            )
-            return
-
-        # Step 2i - Update status to uploading
+        # Mark as uploading
         self._db.update_session_status(session_id, "uploading")
         self._logger.info(
             "upload_started",
@@ -225,21 +207,13 @@ class UploadScheduler:
             manifest_hash=manifest_hash,
         )
 
-        # Step 2j - Upload files
+        # Upload files directly to S3
         upload_result = self._uploader.upload_session(
             session_path=session_path,
-            presigned_urls=reg.presigned_urls,
             manifest=manifest,
         )
 
-        # Step 2k - Upload succeeded
         if upload_result.success:
-            self._api_client.complete_session(
-                session_id=session_id,
-                manifest_hash=manifest_hash,
-                uploaded_files=upload_result.uploaded_files,
-                total_bytes=upload_result.total_bytes_uploaded,
-            )
             self._db.update_session_status(session_id, "uploaded")
             self._logger.info(
                 "upload_completed",
@@ -261,7 +235,21 @@ class UploadScheduler:
                         status="uploaded",
                     )
 
-        # Step 2l - Upload failed
+            # Trigger Step Functions (if configured)
+            if self._sfn:
+                try:
+                    self._sfn.trigger(
+                        session_id=session_id,
+                        manifest_hash=manifest_hash,
+                        uploaded_files=upload_result.uploaded_files,
+                        total_bytes=upload_result.total_bytes_uploaded,
+                    )
+                except Exception as exc:
+                    self._logger.error(
+                        "step_function_trigger_failed",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
         else:
             self._db.update_session_status(
                 session_id, "failed", error=upload_result.error
@@ -275,7 +263,7 @@ class UploadScheduler:
             )
 
     def _retry_failed_sessions(self) -> None:
-        """Re-attempt register + upload for failed sessions under max retries."""
+        """Re-attempt upload for failed sessions under max retries."""
         max_retries = self._config.upload.max_retries
         failed_sessions = self._db.get_failed_sessions()
 
@@ -309,7 +297,7 @@ class UploadScheduler:
                     ignore_patterns=profile.ignore_patterns,
                 )
 
-                self._register_and_upload(
+                self._upload_and_trigger(
                     session_id=session_id,
                     session_path=session_path,
                     profile_name=profile_name,

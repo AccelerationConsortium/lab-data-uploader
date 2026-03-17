@@ -86,7 +86,9 @@ def validate_config(
     for root in cfg.watch.session_roots:
         typer.echo(f"    - {root.path} (profile: {root.profile})")
     typer.echo(f"  profiles: {list(cfg.profiles.keys())}")
-    typer.echo(f"  api_base_url: {cfg.upload.api_base_url}")
+    typer.echo(f"  s3_bucket: {cfg.upload.s3_bucket}")
+    typer.echo(f"  s3_region: {cfg.upload.s3_region}")
+    typer.echo(f"  step_function_arn: {cfg.upload.step_function_arn or '(not configured)'}")
     typer.echo(f"  state_db: {cfg.storage.local_state_db}")
 
 
