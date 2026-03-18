@@ -1,0 +1,212 @@
+name: Deploy Lab Data Uploader
+
+on:
+  pull_request:
+    branches: [main, test, prod]
+    paths:
+      - 'platform/**'
+      - 'app/**'
+      - '.github/**'
+  push:
+    branches: [main, test, prod]
+    paths:
+      - 'platform/**'
+      - 'app/**'
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ASH
+        run: |
+          pip install uv
+          git clone --depth 1 https://github.com/awslabs/automated-security-helper.git /tmp/ash
+          uv tool install /tmp/ash
+      - name: Run ASH
+        run: |
+          mkdir -p /tmp/ash-results
+          ash scan --source-dir . --output-dir /tmp/ash-results --mode local || true
+      - name: Upload Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ash-security-report
+          path: /tmp/ash-results/reports/
+          retention-days: 30
+      - name: Post Summary
+        if: always()
+        run: |
+          if [ -f /tmp/ash-results/reports/ash.summary.txt ]; then
+            echo '## 🔒 ASH Security Scan' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/ash-results/reports/ash.summary.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+      app: ${{ steps.filter.outputs.app }}
+      environment: ${{ steps.env.outputs.environment }}
+      tfvars: ${{ steps.env.outputs.tfvars }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          if [ -z "$CHANGED" ]; then
+            echo "infra=true" >> $GITHUB_OUTPUT
+            echo "app=true" >> $GITHUB_OUTPUT
+          else
+            INFRA=false; APP=false
+            echo "$CHANGED" | grep -q '^platform/' && INFRA=true
+            echo "$CHANGED" | grep -q '^app/' && APP=true
+            echo "infra=$INFRA" >> $GITHUB_OUTPUT
+            echo "app=$APP" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine Environment
+        id: env
+        run: |
+          REF="${{ github.base_ref || github.ref_name }}"
+          case "$REF" in
+            prod) TFVARS="prod" ;;
+            test) TFVARS="test" ;;
+            *)    TFVARS="dev"  ;;
+          esac
+          echo "tfvars=$TFVARS" >> $GITHUB_OUTPUT
+          ENV=$(grep '^environment ' platform/vars/${TFVARS}.tfvars | awk -F'"' '{print $2}')
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout infrastructure-modules
+        uses: actions/checkout@v4
+        with:
+          repository: AccelerationConsortium/infrastructure-modules
+          ref: main
+          path: .modules/infrastructure-modules
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Get S3 Bucket
+        id: setup
+        run: |
+          BUCKET=$(aws ssm get-parameter --name /shared/terraform/state-bucket --region ca-central-1 --query 'Parameter.Value' --output text)
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+
+      - name: Copy tfvars to module
+        run: cp platform/vars/${{ needs.changes.outputs.tfvars }}.tfvars .modules/infrastructure-modules/modules/specialized/python-backend/
+
+      - name: Terraform Init
+        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
+        run: terraform init -backend-config="bucket=${{ steps.setup.outputs.bucket }}" -backend-config="key=lab-data-uploader/${{ needs.changes.outputs.tfvars }}/terraform.tfstate"
+
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
+        id: plan
+        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
+        run: |
+          terraform plan -var-file=${{ needs.changes.outputs.tfvars }}.tfvars -no-color | tee plan.txt
+          echo "plan_output<<EOF" >> $GITHUB_OUTPUT
+          cat plan.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan 📖 \`${{ needs.changes.outputs.environment }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${{ steps.plan.outputs.plan_output }}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Environment: \`${{ needs.changes.outputs.environment }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Apply
+        if: github.event_name == 'push'
+        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
+        run: terraform apply -auto-approve -var-file=${{ needs.changes.outputs.tfvars }}.tfvars
+
+  deploy-app:
+    runs-on: ubuntu-latest
+    needs: [changes, infrastructure]
+    if: always() && !failure() && !cancelled() && needs.changes.outputs.app == 'true' && github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get ECR Repository
+        id: ecr
+        run: |
+          REPO=$(aws ecr describe-repositories --repository-names lab-data-uploader-${{ needs.changes.outputs.environment }} --query 'repositories[0].repositoryUri' --output text)
+          echo "repository=$REPO" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Docker Image
+        working-directory: app
+        run: |
+          docker build --platform linux/amd64 -t lab-data-uploader:${{ github.sha }} .
+          docker tag lab-data-uploader:${{ github.sha }} ${{ steps.ecr.outputs.repository }}:latest
+          docker tag lab-data-uploader:${{ github.sha }} ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
+          docker push ${{ steps.ecr.outputs.repository }}:latest
+          docker push ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
+
+      - name: Force ECS Deployment
+        run: |
+          aws ecs update-service \
+            --cluster ac-cluster \
+            --service lab-data-uploader-${{ needs.changes.outputs.environment }} \
+            --force-new-deployment \
+            --region ca-central-1

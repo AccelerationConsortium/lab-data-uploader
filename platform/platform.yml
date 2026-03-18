@@ -1,0 +1,3 @@
+module_repo: "AccelerationConsortium/infrastructure-modules"
+module_path: "modules/specialized/python-backend"
+module_ref: "main"
