@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# platform — resolve infrastructure module and set up Terraform context.
+# Reads platform.yml, clones the infrastructure-modules repo, and exports
+# BUCKET (Terraform state) and TF_MODULE_PATH for downstream use.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="$SCRIPT_DIR/platform.yml"
+
+# Parse platform.yml
+MODULE_REPO=$(grep '^module_repo:' "$CONFIG" | awk '{print $2}' | tr -d '"')
+MODULE_PATH=$(grep '^module_path:' "$CONFIG" | awk '{print $2}' | tr -d '"')
+MODULE_REF=$(grep '^module_ref:' "$CONFIG" | awk '{print $2}' | tr -d '"')
+
+MODULES_DIR="$SCRIPT_DIR/modules"
+REPO_DIR="$MODULES_DIR/infrastructure-modules"
+
+# Clone or update the infrastructure-modules repo
+if [ -d "$REPO_DIR/.git" ]; then
+  git -C "$REPO_DIR" fetch origin "$MODULE_REF" --depth 1
+  git -C "$REPO_DIR" checkout FETCH_HEAD
+else
+  mkdir -p "$MODULES_DIR"
+  git clone --depth 1 --branch "$MODULE_REF" \
+    "https://github.com/${MODULE_REPO}.git" "$REPO_DIR"
+fi
+
+# Fetch Terraform state bucket from SSM
+BUCKET=$(aws ssm get-parameter \
+  --name /shared/terraform/state-bucket \
+  --region ca-central-1 \
+  --query 'Parameter.Value' \
+  --output text)
+
+export BUCKET
+export TF_MODULE_PATH="$REPO_DIR/$MODULE_PATH"
+
+echo "BUCKET=$BUCKET"
+echo "TF_MODULE_PATH=$TF_MODULE_PATH"

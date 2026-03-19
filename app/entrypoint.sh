@@ -29,4 +29,4 @@ else
 fi
 
 echo "Starting uploader agent..."
-exec uploader-agent run --config /app/config.yaml
+exec python main.py run --config /app/config.yaml

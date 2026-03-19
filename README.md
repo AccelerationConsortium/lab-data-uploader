@@ -27,80 +27,24 @@ Lab PCs (shared dirs)         ECS Task                    AWS
 ## Project Structure
 
 ```
-src/agent/
-├── cli.py                 # CLI entry point (typer)
-├── scheduler.py           # Main polling loop
-├── scanner.py             # Session directory scanner
-├── completion_detector.py # File stability detection
-├── manifest.py            # Manifest generation + hashing
-├── dedup.py               # Deduplication checker
-├── uploader.py            # Direct S3 upload (boto3)
-├── step_functions.py      # Step Functions trigger
-├── state_db.py            # SQLite state tracking
-├── retry.py               # Exponential backoff retry
-└── models.py              # Pydantic config + data models
-```
-
-## Quick Start
-
-### Install
-
-```bash
-pip install git+https://github.com/SissiFeng/lab-data-uploader.git
-```
-
-### Configure
-
-```bash
-cp configs/example.config.yaml config.yaml
-```
-
-Key settings:
-
-```yaml
-agent:
-  machine_id: labpc-01
-  lab_id: sdl1
-  scan_interval_seconds: 60
-  stable_window_seconds: 300
-
-watch:
-  session_roots:
-    - path: "/mnt/labpc-01/sessions"
-      profile: battery_session
-
-profiles:
-  battery_session:
-    required_markers:
-      - "session_summary.json"
-    ignore_patterns:
-      - "*.tmp"
-      - "*.lock"
-
-upload:
-  s3_bucket: "battery-etl-dev-data"
-  s3_region: "ca-central-1"
-  step_function_arn: ""  # optional
-```
-
-### Run
-
-```bash
-uploader-agent run --config config.yaml
-```
-
-Other commands:
-
-```bash
-uploader-agent scan-once --config config.yaml
-uploader-agent validate-config --config config.yaml
-uploader-agent print-manifest --session-path /path/to/session --config config.yaml
-```
-
-## Update
-
-```bash
-pip install --upgrade git+https://github.com/SissiFeng/lab-data-uploader.git
+├── .github/workflows/     # CI/CD
+│   └── deploy.yml
+├── app/                   # Application (Docker context)
+│   ├── Dockerfile
+│   ├── entrypoint.sh
+│   ├── main.py            # Entry point
+│   ├── requirements.txt
+│   ├── config.yaml        # ECS runtime config
+│   └── agent/             # Python package
+├── platform/              # Infrastructure
+│   ├── platform           # Module resolver script
+│   ├── platform.yml
+│   └── vars/
+│       ├── dev.tfvars
+│       ├── test.tfvars
+│       └── prod.tfvars
+├── .gitignore
+└── README.md
 ```
 
 ## Development
@@ -109,6 +53,6 @@ pip install --upgrade git+https://github.com/SissiFeng/lab-data-uploader.git
 git clone https://github.com/SissiFeng/lab-data-uploader.git
 cd lab-data-uploader
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest tests/ -q
+pip install -e "./app[dev]"
+pytest app/tests/ -q
 ```

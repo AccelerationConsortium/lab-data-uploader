@@ -1,0 +1,9 @@
+tests/
+scripts/
+configs/
+pyproject.toml
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

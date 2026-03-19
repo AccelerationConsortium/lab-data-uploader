@@ -1,44 +1,27 @@
-# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
 *.egg-info/
 dist/
 build/
-*.egg
-
-# Virtual environment
-.venv/
-venv/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Runtime state (generated locally)
-state/
-service_state/
-logs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment
-.env
-
-# pytest
 .pytest_cache/
-
-# mypy
-.mypy_cache/
-
-# Terraform
+.coverage
+htmlcov/
+.env
+.DS_Store
+platform/modules/
 .terraform/
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
-
-# Claude
+.ruff_cache/
+.mypy_cache/
+state/
+service_state/
+logs/
 .claude/
