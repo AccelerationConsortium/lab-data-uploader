@@ -130,8 +130,8 @@ class TestUploadSessionSuccess:
         assert result.total_bytes_uploaded == 20
         assert result.error is None
 
-        # Verify put_object was called (file + manifest)
-        assert mock_s3.put_object.call_count == 2
+        # Verify put_object was called (file + manifest + _COMPLETE)
+        assert mock_s3.put_object.call_count == 3
 
         # Verify S3 key for the data file
         first_call = mock_s3.put_object.call_args_list[0]

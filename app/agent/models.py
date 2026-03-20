@@ -62,13 +62,11 @@ class UploadConfig(BaseModel):
     s3_bucket: str
     s3_region: str = "ca-central-1"
     s3_prefix: str = ""
-    step_function_arn: str = ""  # empty = skip trigger
     max_retries: int = 10
     initial_backoff_seconds: int = 30
 
 
 class StorageConfig(BaseModel):
-    local_state_db: str = "./state/upload_state.db"
     manifest_cache_dir: str = "./state/manifests"
     log_dir: str = "./logs"
 

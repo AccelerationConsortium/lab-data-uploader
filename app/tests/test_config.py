@@ -78,13 +78,11 @@ class TestDefaultValues:
         assert cfg.upload.s3_bucket == "test-bucket"
         assert cfg.upload.s3_region == "ca-central-1"
         assert cfg.upload.s3_prefix == ""
-        assert cfg.upload.step_function_arn == ""
         assert cfg.upload.max_retries == 10
         assert cfg.upload.initial_backoff_seconds == 30
 
     def test_storage_defaults(self, tmp_path: Path) -> None:
         cfg = load_config(_write(tmp_path, VALID_YAML))
-        assert cfg.storage.local_state_db == "./state/upload_state.db"
         assert cfg.storage.manifest_cache_dir == "./state/manifests"
         assert cfg.storage.log_dir == "./logs"
 

@@ -35,11 +35,9 @@ upload:
   s3_bucket: "battery-etl-dev-data"
   s3_region: "ca-central-1"
   s3_prefix: ""
-  step_function_arn: ""  # set to ARN to enable post-upload trigger
   max_retries: 10
   initial_backoff_seconds: 30
 
 storage:
-  local_state_db: "./state/upload_state.db"
   manifest_cache_dir: "./state/manifests"
   log_dir: "./logs"

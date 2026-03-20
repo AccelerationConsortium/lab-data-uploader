@@ -59,7 +59,6 @@ def app_config(tmp_path, session_root):
             "initial_backoff_seconds": 1,
         },
         storage={
-            "local_state_db": str(tmp_path / "state" / "test.db"),
             "manifest_cache_dir": str(tmp_path / "manifests"),
             "log_dir": str(tmp_path / "logs"),
         },
@@ -94,13 +93,14 @@ def test_full_upload_pipeline(app_config, session_root, mock_s3):
     # Second scan: with stable_window=0, session should now be stable
     scheduler.run_once()
 
-    # Verify S3 uploads happened (4 data files + 1 manifest.json)
-    assert mock_s3.put_object.call_count == 5
+    # Verify S3 uploads happened (4 data files + manifest.json + _COMPLETE)
+    assert mock_s3.put_object.call_count == 6
 
     # Verify S3 keys include the prefix
     keys = [call.kwargs["Key"] for call in mock_s3.put_object.call_args_list]
     assert all(k.startswith("lab/SES-001/") for k in keys)
     assert "lab/SES-001/manifest.json" in keys
+    assert "lab/SES-001/_COMPLETE" in keys
 
     # Verify DB state
     session_row = scheduler._db.get_session("SES-001")
@@ -117,7 +117,8 @@ def test_full_upload_pipeline(app_config, session_root, mock_s3):
 
 
 def test_duplicate_upload_skipped(app_config, session_root, mock_s3):
-    """After a successful upload, a second scan should detect the duplicate and skip."""
+    """After a successful upload the session folder is moved to processed/.
+    A third scan finds no sessions in the root and makes no new S3 calls."""
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
@@ -129,12 +130,9 @@ def test_duplicate_upload_skipped(app_config, session_root, mock_s3):
     scheduler.run_once()
     first_put_count = mock_s3.put_object.call_count
 
-    # Third scan should detect duplicate and NOT upload again
+    # Third scan: folder has been moved, nothing to upload
     scheduler.run_once()
     assert mock_s3.put_object.call_count == first_put_count  # no new uploads
-
-    session_row = scheduler._db.get_session("SES-001")
-    assert session_row["status"] in ("uploaded", "duplicate")
 
     scheduler.close()
 
@@ -182,34 +180,35 @@ def test_failed_upload_then_retry(app_config, session_root, mock_s3):
 # --------------------------------------------------------------------------
 
 
-def test_session_change_triggers_new_version(app_config, session_root, mock_s3):
-    """If session content changes after upload, new manifest_hash triggers re-upload."""
+def test_second_independent_session_uploaded(app_config, session_root, mock_s3):
+    """A second session appearing after the first is uploaded independently."""
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
 
     scheduler = UploadScheduler(app_config)
 
-    # Complete first upload
+    # Upload first session
+    scheduler.run_once()
+    scheduler.run_once()
+    first_put_count = mock_s3.put_object.call_count
+
+    # A completely new session folder with a different session_id appears
+    session2 = session_root / "session_002"
+    session2.mkdir()
+    (session2 / "data.csv").write_text("x,y\n10,20\n")
+    (session2 / "metadata.json").write_text('{"session_id": "SES-002"}')
+    (session2 / "session_summary.json").write_text('{"status":"done"}')
+
+    # Two scans: detect + upload
     scheduler.run_once()
     scheduler.run_once()
 
-    first_hash = scheduler._db.get_session("SES-001")["manifest_hash"]
+    assert mock_s3.put_object.call_count > first_put_count
 
-    # Modify session content - add a new file
-    session_dir = session_root / "session_001"
-    (session_dir / "extra_data.csv").write_text("x,y\n10,20\n")
-
-    # Reset detector snapshots so it re-evaluates stability
-    scheduler._detector._snapshots.clear()
-
-    # Two scans: first re-detects, second uploads new version
-    scheduler.run_once()
-    scheduler.run_once()
-
-    session_row = scheduler._db.get_session("SES-001")
-    assert session_row["status"] == "uploaded"
-    assert session_row["manifest_hash"] != first_hash
+    row = scheduler._db.get_session("SES-002")
+    assert row is not None
+    assert row["status"] == "uploaded"
 
     scheduler.close()
 
@@ -263,37 +262,31 @@ def test_temp_files_ignored(app_config, session_root, mock_s3):
 
 
 # --------------------------------------------------------------------------
-# Test: Step Functions triggered on success
+# Test: _COMPLETE marker uploaded as last S3 key
 # --------------------------------------------------------------------------
 
 
-def test_step_functions_triggered(app_config, session_root, mock_s3):
-    """When step_function_arn is set, Step Functions is triggered after upload."""
-    app_config.upload.step_function_arn = (
-        "arn:aws:states:us-east-1:123456789:stateMachine:TestMachine"
-    )
-
+def test_complete_marker_uploaded(app_config, session_root, mock_s3):
+    """The _COMPLETE marker is written to S3 after all files and manifest.json."""
     from agent.logging_utils import setup_logging
 
     setup_logging(app_config.storage.log_dir)
 
-    with patch("agent.step_functions.boto3") as mock_sfn_boto3:
-        mock_sfn_client = MagicMock()
-        mock_sfn_boto3.client.return_value = mock_sfn_client
-        mock_sfn_client.start_execution.return_value = {
-            "executionArn": "arn:aws:states:us-east-1:123456789:execution:TestMachine:x"
-        }
+    scheduler = UploadScheduler(app_config)
+    scheduler.run_once()
+    scheduler.run_once()
 
-        scheduler = UploadScheduler(app_config)
-        scheduler.run_once()
-        scheduler.run_once()
+    keys = [call.kwargs["Key"] for call in mock_s3.put_object.call_args_list]
 
-        # Verify Step Functions was called
-        assert mock_sfn_client.start_execution.call_count == 1
+    # _COMPLETE must be present
+    assert "lab/SES-001/_COMPLETE" in keys
 
-        call_kwargs = mock_sfn_client.start_execution.call_args.kwargs
-        input_data = json.loads(call_kwargs["input"])
-        assert input_data["session_id"] == "SES-001"
-        assert input_data["total_files"] == 4
+    # _COMPLETE must be the very last upload
+    assert keys[-1] == "lab/SES-001/_COMPLETE"
 
-        scheduler.close()
+    # manifest.json must come before _COMPLETE
+    manifest_idx = keys.index("lab/SES-001/manifest.json")
+    complete_idx = keys.index("lab/SES-001/_COMPLETE")
+    assert manifest_idx < complete_idx
+
+    scheduler.close()

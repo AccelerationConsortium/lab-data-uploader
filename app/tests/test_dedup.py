@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from agent.dedup import DeduplicationChecker
@@ -11,9 +9,9 @@ from agent.state_db import StateDB
 
 
 @pytest.fixture()
-def db(tmp_path: Path) -> StateDB:
-    """Return an initialised in-tmp-dir StateDB."""
-    sdb = StateDB(str(tmp_path / "state.db"))
+def db() -> StateDB:
+    """Return an initialised StateDB (backed by the in-memory SQLite shim)."""
+    sdb = StateDB()
     sdb.init_db()
     return sdb
 

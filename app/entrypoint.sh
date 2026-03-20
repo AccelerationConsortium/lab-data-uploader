@@ -21,7 +21,7 @@ if [ -n "$NFS_MOUNTS" ]; then
     IFS=':' read -r host share mountpoint <<< "$mount_spec"
     mkdir -p "$mountpoint"
     echo "Mounting $host:$share -> $mountpoint"
-    mount -t nfs -o ro,nolock,soft,timeo=30 "$host:$share" "$mountpoint" || echo "WARNING: Failed to mount $host:$share"
+    mount -t nfs -o rw,nolock,soft,timeo=30 "$host:$share" "$mountpoint" || echo "WARNING: Failed to mount $host:$share"
   done
   echo "NFS mounts complete."
 else

@@ -57,6 +57,10 @@ class SessionScanner:
                 if not entry.is_dir():
                     continue
 
+                # Skip the reserved processed/ subdirectory created by the agent
+                if entry.name == "processed":
+                    continue
+
                 if self._matches_ignore(entry.name, ignore_patterns):
                     continue
 
