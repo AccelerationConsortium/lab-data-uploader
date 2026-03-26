@@ -95,10 +95,20 @@ jobs:
   infrastructure:
     runs-on: ubuntu-latest
     needs: changes
+    environment: ${{ needs.changes.outputs.tfvars }}
     if: needs.changes.outputs.infra == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Generate token from GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AC_APP_ID }}
+          private-key: ${{ secrets.AC_APP_PRIVATE_KEY }}
+          owner: AccelerationConsortium
+          repositories: infrastructure-modules
 
       - name: Checkout infrastructure-modules
         uses: actions/checkout@v4
@@ -106,7 +116,7 @@ jobs:
           repository: AccelerationConsortium/infrastructure-modules
           ref: main
           path: .modules/infrastructure-modules
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -174,6 +184,7 @@ jobs:
   deploy-app:
     runs-on: ubuntu-latest
     needs: [changes, infrastructure]
+    environment: ${{ needs.changes.outputs.tfvars }}
     if: always() && !failure() && !cancelled() && needs.changes.outputs.app == 'true' && github.event_name == 'push'
     steps:
       - name: Checkout
