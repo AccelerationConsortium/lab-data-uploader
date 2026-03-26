@@ -95,8 +95,8 @@ jobs:
   infrastructure:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.infra == 'true'
     environment: ${{ needs.changes.outputs.tfvars }}
+    if: needs.changes.outputs.infra == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Generate token from GitHub App
@@ -138,8 +138,8 @@ jobs:
   deploy-app:
     runs-on: ubuntu-latest
     needs: [changes, infrastructure]
-    if: always() && !failure() && !cancelled() && needs.changes.outputs.app == 'true' && github.event_name == 'push'
     environment: ${{ needs.changes.outputs.tfvars }}
+    if: always() && !failure() && !cancelled() && needs.changes.outputs.app == 'true' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
