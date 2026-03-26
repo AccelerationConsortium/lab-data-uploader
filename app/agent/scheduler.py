@@ -2,41 +2,32 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
+from pathlib import Path
 
 from agent.completion_detector import CompletionDetector
-from agent.dedup import DeduplicationChecker
 from agent.logging_utils import get_logger
 from agent.manifest import compute_manifest_hash, generate_manifest, save_manifest
 from agent.models import AppConfig, CandidateSession, SessionManifest
 from agent.scanner import SessionScanner
 from agent.state_db import StateDB
-from agent.step_functions import StepFunctionsTrigger
 from agent.uploader import FileUploader
 
 
 class UploadScheduler:
-    """Orchestrates the full upload pipeline: scan, detect, manifest, dedup, upload, trigger."""
+    """Orchestrates the full upload pipeline: scan, detect, manifest, upload, move."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._logger = get_logger("scheduler")
 
-        self._db = StateDB(config.storage.local_state_db)
+        self._db = StateDB()
         self._db.init_db()
 
         self._scanner = SessionScanner(config)
         self._detector = CompletionDetector(config.agent.stable_window_seconds)
-        self._dedup = DeduplicationChecker(self._db)
         self._uploader = FileUploader(config.upload)
-
-        # Step Functions trigger (optional — skip if ARN is empty)
-        self._sfn: StepFunctionsTrigger | None = None
-        if config.upload.step_function_arn:
-            self._sfn = StepFunctionsTrigger(
-                arn=config.upload.step_function_arn,
-                region=config.upload.s3_region,
-            )
 
         self._shutdown = threading.Event()
 
@@ -96,8 +87,15 @@ class UploadScheduler:
         session_path = candidate.session_path
         profile_name = candidate.profile_name
 
-        # Skip if already uploading
         existing = self._db.get_session(session_id)
+
+        # If the upload already succeeded but the folder wasn't moved yet
+        # (e.g. previous move failed), attempt the move and stop.
+        if existing and existing["status"] == "uploaded":
+            self._move_to_processed(session_path, session_id)
+            return
+
+        # Skip if an upload is already in progress
         if existing and existing["status"] == "uploading":
             self._logger.debug(
                 "session_skip",
@@ -129,7 +127,7 @@ class UploadScheduler:
 
         self._logger.info("session_stable", session_id=session_id)
 
-        # Build manifest
+        # Build manifest (needed both for the upload and for DB observability)
         manifest = generate_manifest(
             session_path=session_path,
             session_id=session_id,
@@ -137,8 +135,6 @@ class UploadScheduler:
             lab_id=self._config.agent.lab_id,
             ignore_patterns=profile.ignore_patterns,
         )
-
-        # Compute manifest hash
         manifest_hash = compute_manifest_hash(manifest)
         self._logger.info(
             "manifest_created",
@@ -147,28 +143,7 @@ class UploadScheduler:
             file_count=manifest.file_count,
             total_bytes=manifest.total_bytes,
         )
-
-        # Save manifest to cache
         save_manifest(manifest, manifest_hash, self._config.storage.manifest_cache_dir)
-
-        # Local dedup check
-        dedup_result = self._dedup.check(session_id, manifest_hash)
-        if dedup_result.is_duplicate:
-            self._db.upsert_session(
-                session_id=session_id,
-                session_path=session_path,
-                profile=profile_name,
-                manifest_hash=manifest_hash,
-                status="duplicate",
-                file_count=manifest.file_count,
-                total_bytes=manifest.total_bytes,
-            )
-            self._logger.info(
-                "session_duplicate_local",
-                session_id=session_id,
-                manifest_hash=manifest_hash,
-            )
-            return
 
         # Mark as ready, then upload
         self._db.upsert_session(
@@ -181,7 +156,7 @@ class UploadScheduler:
             total_bytes=manifest.total_bytes,
         )
 
-        self._upload_and_trigger(
+        self._upload_session(
             session_id=session_id,
             session_path=session_path,
             profile_name=profile_name,
@@ -189,7 +164,7 @@ class UploadScheduler:
             manifest_hash=manifest_hash,
         )
 
-    def _upload_and_trigger(
+    def _upload_session(
         self,
         session_id: str,
         session_path: str,
@@ -197,9 +172,8 @@ class UploadScheduler:
         manifest: SessionManifest,
         manifest_hash: str,
     ) -> None:
-        """Upload files to S3 and trigger Step Functions on success."""
+        """Upload files to S3 (including manifest + _COMPLETE marker), then move to processed/."""
 
-        # Mark as uploading
         self._db.update_session_status(session_id, "uploading")
         self._logger.info(
             "upload_started",
@@ -207,7 +181,6 @@ class UploadScheduler:
             manifest_hash=manifest_hash,
         )
 
-        # Upload files directly to S3
         upload_result = self._uploader.upload_session(
             session_path=session_path,
             manifest=manifest,
@@ -235,21 +208,10 @@ class UploadScheduler:
                         status="uploaded",
                     )
 
-            # Trigger Step Functions (if configured)
-            if self._sfn:
-                try:
-                    self._sfn.trigger(
-                        session_id=session_id,
-                        manifest_hash=manifest_hash,
-                        uploaded_files=upload_result.uploaded_files,
-                        total_bytes=upload_result.total_bytes_uploaded,
-                    )
-                except Exception as exc:
-                    self._logger.error(
-                        "step_function_trigger_failed",
-                        session_id=session_id,
-                        error=str(exc),
-                    )
+            # Move the session folder to processed/ on the NFS share.
+            # If this fails the DB still shows 'uploaded'; the next scan cycle
+            # will retry the move via _process_candidate.
+            self._move_to_processed(session_path, session_id)
         else:
             self._db.update_session_status(
                 session_id, "failed", error=upload_result.error
@@ -260,6 +222,41 @@ class UploadScheduler:
                 session_id=session_id,
                 error=upload_result.error,
                 failed_files=upload_result.failed_files,
+            )
+
+    def _move_to_processed(self, session_path: str, session_id: str) -> None:
+        """Move the session folder into the processed/ subdirectory.
+
+        The NFS mount must be read-write (rw) for this to succeed.
+        On failure the error is logged but not propagated — the DB status
+        remains 'uploaded' and the next scan cycle will retry the move.
+        """
+        src = Path(session_path)
+        if not src.exists():
+            self._logger.warning(
+                "session_move_skipped",
+                session_id=session_id,
+                reason="source_not_found",
+                path=session_path,
+            )
+            return
+
+        processed_dir = src.parent / "processed"
+        try:
+            processed_dir.mkdir(exist_ok=True)
+            dest = processed_dir / src.name
+            shutil.move(str(src), str(dest))
+            self._logger.info(
+                "session_moved_to_processed",
+                session_id=session_id,
+                dest=str(dest),
+            )
+        except OSError as exc:
+            self._logger.error(
+                "session_move_failed",
+                session_id=session_id,
+                src=session_path,
+                error=str(exc),
             )
 
     def _retry_failed_sessions(self) -> None:
@@ -279,7 +276,6 @@ class UploadScheduler:
             session_id = session_row["session_id"]
             session_path = session_row["session_path"]
             profile_name = session_row["profile"]
-            manifest_hash = session_row["manifest_hash"]
 
             self._logger.info(
                 "session_retry",
@@ -296,8 +292,9 @@ class UploadScheduler:
                     lab_id=self._config.agent.lab_id,
                     ignore_patterns=profile.ignore_patterns,
                 )
+                manifest_hash = compute_manifest_hash(manifest)
 
-                self._upload_and_trigger(
+                self._upload_session(
                     session_id=session_id,
                     session_path=session_path,
                     profile_name=profile_name,

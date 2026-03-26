@@ -55,11 +55,14 @@ class FileUploader:
             else:
                 failed.append(file_entry.relative_path)
 
-        # Upload manifest JSON alongside session files
+        success = len(failed) == 0
+
+        # Upload manifest and _COMPLETE marker only when all files succeeded.
+        # Partial uploads still get a manifest so partial state is visible in S3.
         if uploaded:
             self._upload_manifest(manifest)
-
-        success = len(failed) == 0
+        if success:
+            self._upload_complete_marker(manifest.session_id)
 
         return UploadResult(
             success=success,
@@ -106,3 +109,21 @@ class FileUploader:
             logger.info("manifest_uploaded", s3_key=s3_key)
         except ClientError as exc:
             logger.warning("manifest_upload_failed", s3_key=s3_key, error=str(exc))
+
+    def _upload_complete_marker(self, session_id: str) -> None:
+        """Write an empty _COMPLETE object to S3.
+
+        EventBridge watches for this key pattern to trigger Step Functions,
+        replacing the former in-process StepFunctionsTrigger call.
+        """
+        s3_key = self._build_key(session_id, "_COMPLETE")
+        try:
+            self._s3.put_object(Bucket=self._bucket, Key=s3_key, Body=b"")
+            logger.info("complete_marker_uploaded", session_id=session_id, s3_key=s3_key)
+        except ClientError as exc:
+            logger.warning(
+                "complete_marker_upload_failed",
+                session_id=session_id,
+                s3_key=s3_key,
+                error=str(exc),
+            )
