@@ -25,13 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ASH
+      - name: Install & Run ASH
         run: |
           pip install uv
           git clone --depth 1 https://github.com/awslabs/automated-security-helper.git /tmp/ash
           uv tool install /tmp/ash
-      - name: Run ASH
-        run: |
           mkdir -p /tmp/ash-results
           ash scan --source-dir . --output-dir /tmp/ash-results --mode local || true
       - name: Upload Report
@@ -58,9 +56,9 @@ jobs:
       app: ${{ steps.filter.outputs.app }}
       environment: ${{ steps.env.outputs.environment }}
       tfvars: ${{ steps.env.outputs.tfvars }}
+      app_name: ${{ steps.env.outputs.app_name }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
@@ -91,122 +89,74 @@ jobs:
           echo "tfvars=$TFVARS" >> $GITHUB_OUTPUT
           ENV=$(grep '^environment ' platform/vars/${TFVARS}.tfvars | awk -F'"' '{print $2}')
           echo "environment=$ENV" >> $GITHUB_OUTPUT
+          APP=$(grep '^app_name ' platform/vars/${TFVARS}.tfvars | awk -F'"' '{print $2}')
+          echo "app_name=$APP" >> $GITHUB_OUTPUT
 
   infrastructure:
     runs-on: ubuntu-latest
     needs: changes
     if: needs.changes.outputs.infra == 'true'
+    environment: ${{ needs.changes.outputs.tfvars }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Checkout infrastructure-modules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Generate token from GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AC_APP_ID }}
+          private-key: ${{ secrets.AC_APP_PRIVATE_KEY }}
+          owner: AccelerationConsortium
+          repositories: infrastructure-modules
+      - uses: actions/checkout@v4
         with:
           repository: AccelerationConsortium/infrastructure-modules
           ref: main
           path: .modules/infrastructure-modules
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ca-central-1
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.0
 
-      - name: Get S3 Bucket
-        id: setup
+      - name: Terraform Init & Apply
+        env:
+          APP: ${{ needs.changes.outputs.app_name }}
         run: |
           BUCKET=$(aws ssm get-parameter --name /shared/terraform/state-bucket --region ca-central-1 --query 'Parameter.Value' --output text)
-          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
-
-      - name: Copy tfvars to module
-        run: cp platform/vars/${{ needs.changes.outputs.tfvars }}.tfvars .modules/infrastructure-modules/modules/specialized/python-backend/
-
-      - name: Terraform Init
-        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
-        run: terraform init -backend-config="bucket=${{ steps.setup.outputs.bucket }}" -backend-config="key=lab-data-uploader/${{ needs.changes.outputs.tfvars }}/terraform.tfstate"
-
-      - name: Terraform Plan
-        if: github.event_name == 'pull_request'
-        id: plan
-        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
-        run: |
-          terraform plan -var-file=${{ needs.changes.outputs.tfvars }}.tfvars -no-color | tee plan.txt
-          echo "plan_output<<EOF" >> $GITHUB_OUTPUT
-          cat plan.txt >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Comment PR with Plan
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const output = `#### Terraform Plan 📖 \`${{ needs.changes.outputs.environment }}\`
-
-            <details><summary>Show Plan</summary>
-
-            \`\`\`terraform
-            ${{ steps.plan.outputs.plan_output }}
-            \`\`\`
-
-            </details>
-
-            *Pusher: @${{ github.actor }}, Environment: \`${{ needs.changes.outputs.environment }}\`*`;
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
-            })
-
-      - name: Terraform Apply
-        if: github.event_name == 'push'
-        working-directory: .modules/infrastructure-modules/modules/specialized/python-backend
-        run: terraform apply -auto-approve -var-file=${{ needs.changes.outputs.tfvars }}.tfvars
+          cp platform/vars/${{ needs.changes.outputs.tfvars }}.tfvars .modules/infrastructure-modules/modules/specialized/python-backend/
+          cd .modules/infrastructure-modules/modules/specialized/python-backend
+          terraform init -backend-config="bucket=$BUCKET" -backend-config="key=${APP}/${{ needs.changes.outputs.tfvars }}/terraform.tfstate"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            terraform apply -auto-approve -var-file=${{ needs.changes.outputs.tfvars }}.tfvars
+          else
+            terraform plan -var-file=${{ needs.changes.outputs.tfvars }}.tfvars -no-color
+          fi
 
   deploy-app:
     runs-on: ubuntu-latest
     needs: [changes, infrastructure]
     if: always() && !failure() && !cancelled() && needs.changes.outputs.app == 'true' && github.event_name == 'push'
+    environment: ${{ needs.changes.outputs.tfvars }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ca-central-1
+      - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Get ECR Repository
-        id: ecr
+      - name: Build & Deploy
+        env:
+          APP: ${{ needs.changes.outputs.app_name }}
+          ENV: ${{ needs.changes.outputs.environment }}
         run: |
-          REPO=$(aws ecr describe-repositories --repository-names lab-data-uploader-${{ needs.changes.outputs.environment }} --query 'repositories[0].repositoryUri' --output text)
-          echo "repository=$REPO" >> $GITHUB_OUTPUT
-
-      - name: Build and Push Docker Image
-        working-directory: app
-        run: |
-          docker build --platform linux/amd64 -t lab-data-uploader:${{ github.sha }} .
-          docker tag lab-data-uploader:${{ github.sha }} ${{ steps.ecr.outputs.repository }}:latest
-          docker tag lab-data-uploader:${{ github.sha }} ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
-          docker push ${{ steps.ecr.outputs.repository }}:latest
-          docker push ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
-
-      - name: Force ECS Deployment
-        run: |
-          aws ecs update-service \
-            --cluster ac-cluster \
-            --service lab-data-uploader-${{ needs.changes.outputs.environment }} \
-            --force-new-deployment \
-            --region ca-central-1
+          REPO=$(aws ecr describe-repositories --repository-names ${APP}-${ENV} --query 'repositories[0].repositoryUri' --output text)
+          cd app
+          docker build --platform linux/amd64 -t ${APP}:${{ github.sha }} .
+          docker tag ${APP}:${{ github.sha }} ${REPO}:latest
+          docker push ${REPO}:latest
+          CLUSTER=$(aws ssm get-parameter --name /shared/ecs/cluster-name --region ca-central-1 --query 'Parameter.Value' --output text)
+          aws ecs update-service --cluster $CLUSTER --service ${APP}-${ENV} --force-new-deployment --region ca-central-1
